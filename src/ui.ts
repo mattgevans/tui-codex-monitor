@@ -98,10 +98,13 @@ export function dashboard(observer: DesktopObserver, screenOptions: blessed.Widg
     screen.key(key, () => { if (!searching) { filter = value; notice = ''; render(); } });
   for (const key of ['x', 'u']) screen.key(key, () => {
     if (searching) return;
-    const agent = rows[(list as blessed.Widgets.ListElement & { selected: number }).selected];
+    const index = (list as blessed.Widgets.ListElement & { selected: number }).selected;
+    const agent = rows[index];
     if (!agent) return;
     try {
       archive.set(agent.id, key === 'x');
+      if ((key === 'x' && filter !== 'archived') || (key === 'u' && filter === 'archived'))
+        selectedId = rows[index + 1]?.id ?? rows[index - 1]?.id;
       notice = `${clean(agent.title)}: ${key === 'x' ? 'archived' : 'restored'} locally`;
     } catch (error) { notice = `Could not save archive: ${clean(String(error))}`; }
     render();

@@ -8,6 +8,7 @@ import { DesktopObserver } from '../src/observer';
 import { ReadState } from '../src/read-state';
 import type { Agent } from '../src/model';
 import { ArchiveState } from '../src/archive-state';
+import type { Widgets } from 'blessed';
 
 test('terminal renders attention, name, directory, filters and read acknowledgement without Electron', () => {
   const root = mkdtempSync('/tmp/tcm-ui-');
@@ -70,6 +71,25 @@ test('terminal renders attention, name, directory, filters and read acknowledgem
     assert.match(view, /CODEX MONITOR/);
     assert.match(view, /Directory: \/tmp\/example-repository/);
     assert.match(view, /mark read\/unread/);
+
+    // Removing a middle row selects its successor; removing the last selects its predecessor.
+    observer.agents = ['A', 'B', 'C', 'D'].map(letter => ({ ...waiting,
+      id: `codex:session-${letter}`, externalId: `session-${letter}`, title: `Session ${letter}`,
+      runtime: 'WORKING', status: 'running', attentionToken: null, awaitingInput: false,
+    }));
+    key('a');
+    const list = ui.screen.children.find(child => child.type === 'list') as Widgets.ListElement;
+    list.select(1);
+    key('x');
+    assert.match(screenshot(), /Session C  \[WORKING\]/);
+    observer.emit('update');
+    assert.match(screenshot(), /Session C  \[WORKING\]/);
+    key('x');
+    assert.match(screenshot(), /Session D  \[WORKING\]/);
+    key('x');
+    assert.match(screenshot(), /Session A  \[WORKING\]/);
+    key('x');
+    assert.match(screenshot(), /No sessions match/);
   } finally {
     ui.close(); input.destroy(); output.destroy(); rmSync(root, { recursive: true, force: true });
   }
