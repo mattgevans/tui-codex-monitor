@@ -1,0 +1,18 @@
+{
+  "name": "tui-codex-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "tui": "node --disable-warning=ExperimentalWarning --import tsx src/cli.ts",
+    "probe": "node --disable-warning=ExperimentalWarning --import tsx src/cli.ts --probe",
+    "test": "node --disable-warning=ExperimentalWarning --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "smoke": "npm run probe"
+  },
+  "dependencies": { "blessed": "0.1.81", "immer": "^10.1.1", "tsx": "^4.20.0" },
+  "devDependencies": { "@types/blessed": "^0.1.27", "@types/node": "^24.0.0", "typescript": "^5.9.0" }
+}
