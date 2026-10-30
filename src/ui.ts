@@ -2,8 +2,11 @@ import blessed from 'blessed';
 import { DesktopObserver } from './observer';
 import { age, clean, needsAttention, type Agent } from './model';
 import { ReadState } from './read-state';
+import { ArchiveState } from './archive-state';
+import { dirname, join } from 'node:path';
 
 export function dashboard(observer: DesktopObserver, screenOptions: blessed.Widgets.IScreenOptions = {}, read = new ReadState()) {
+  const archive = new ArchiveState(join(dirname(read.path), 'archive.json'));
   const screen = blessed.screen({ smartCSR: true, title: 'Codex Monitor', fullUnicode: true, ...screenOptions });
   const background = '#101522';
   const header = blessed.box({ parent: screen, top: 0, left: 1, height: 4, width: '100%-2', tags: true, style: { fg: '#e1e9ff', bg: background } });
@@ -15,7 +18,7 @@ export function dashboard(observer: DesktopObserver, screenOptions: blessed.Widg
   const detail = blessed.box({ parent: screen, bottom: 2, height: 6, left: 0, right: 0, border: 'line',
     label: ' Selected session ', tags: false, style: { fg: '#e1e9ff', bg: background, border: { fg: '#536b9b' } } });
   const footer = blessed.box({ parent: screen, bottom: 0, height: 2, left: 1, right: 1, style: { fg: '#9fb6d9', bg: background } });
-  let filter: 'all' | 'attention' | 'working' | 'read' = 'all';
+  let filter: 'all' | 'attention' | 'working' | 'read' | 'archived' = 'all';
   let query = '';
   let rows: Agent[] = [];
   let selectedId: string | undefined;
@@ -41,7 +44,7 @@ export function dashboard(observer: DesktopObserver, screenOptions: blessed.Widg
     else {
       selectedId = agent.id;
       detail.setContent([
-        `${clean(agent.title)}  [${agent.runtime}${read.isRead(agent) ? ' · READ locally' : ''}]`,
+        `${clean(agent.title)}  [${agent.runtime}${archive.has(agent.id) ? ' · ARCHIVED locally' : ''}${read.isRead(agent) ? ' · READ locally' : ''}]`,
         `Directory: ${clean(agent.directory || 'Unavailable')}`,
         `${clean(agent.detail)} · ${agent.evidence === 'live' ? 'Live desktop state' : 'State unavailable'}`,
         `Activity: ${new Date(agent.activityAt || agent.updatedAt).toLocaleString()}${agent.activityAt ? ' (turn / observed state change)' : ' (catalog updated)'} · ${agent.externalId}`,
@@ -51,8 +54,9 @@ export function dashboard(observer: DesktopObserver, screenOptions: blessed.Widg
   const render = () => {
     if (closed) return;
     rendering = true;
-    const all = observer.agents;
-    rows = all.filter(a => !a.archived).filter(a =>
+    const source = observer.agents.filter(a => !a.archived);
+    const all = source.filter(a => !archive.has(a.id));
+    rows = source.filter(a => filter === 'archived' ? archive.has(a.id) : !archive.has(a.id)).filter(a =>
       filter === 'attention' ? urgent(a) : filter === 'working' ? a.runtime === 'WORKING' : filter === 'read' ? read.isRead(a) : true,
     ).filter(a => `${a.title} ${a.directory || ''} ${a.externalId}`.toLowerCase().includes(query.toLowerCase()))
       .sort((a, b) => priority(a) - priority(b) || (b.activityAt || b.updatedAt) - (a.activityAt || a.updatedAt) || a.id.localeCompare(b.id));
@@ -70,9 +74,9 @@ export function dashboard(observer: DesktopObserver, screenOptions: blessed.Widg
     const index = rows.findIndex(a => a.id === selectedId);
     list.select(index >= 0 ? index : 0);
     const counts = `${all.filter(a => a.runtime === 'WORKING').length} working  ·  ${all.filter(urgent).length} need attention  ·  ${all.filter(a => read.isRead(a)).length} read  ·  ${all.filter(a => a.runtime === 'UNKNOWN').length} unknown`;
-    header.setContent(`{bold}{#7ab8ff-fg}CODEX MONITOR{/#7ab8ff-fg}{/bold}  ${counts}\n${clean(observer.health.message)}\nView: ${filter} · ${rows.length}/${all.length} sessions${query ? ` · search: ${clean(query)}` : ''}  |  ! attention  r read locally  ▶ working\n  STATUS  SESSION NAME${' '.repeat(Math.max(1, titleWidth - 12))}WORKING DIRECTORY / REPOSITORY    ACTIVITY`);
+    header.setContent(`{bold}{#7ab8ff-fg}CODEX MONITOR{/#7ab8ff-fg}{/bold}  ${counts}\n${clean(observer.health.message)}\nView: ${filter} · ${rows.length}/${source.length} sessions · ${source.length - all.length} archived${query ? ` · search: ${clean(query)}` : ''}  |  ! attention  r read locally  ▶ working\n  STATUS  SESSION NAME${' '.repeat(Math.max(1, titleWidth - 12))}WORKING DIRECTORY / REPOSITORY    ACTIVITY`);
     renderDetail();
-    footer.setContent(`↑↓/jk select · r mark read/unread · a all · n attention · w working · d read · / search · Esc clear · q quit\n${notice || 'Read only silences this item locally; new requests or turns return to attention. No Codex session is changed.'}`);
+    footer.setContent(`↑↓/jk · r mark read/unread · x archive · v archived · u restore · a all · n attention\n${notice || 'w working · d read · / search · Esc clear · q quit | Read/archive affect only this dashboard.'}`);
     rendering = false;
     screen.render();
   };
@@ -90,8 +94,18 @@ export function dashboard(observer: DesktopObserver, screenOptions: blessed.Widg
     } catch (error) { notice = `Could not save read state: ${clean(String(error))}`; }
     render();
   });
-  for (const [key, value] of Object.entries({ a: 'all', n: 'attention', w: 'working', d: 'read' } as const))
+  for (const [key, value] of Object.entries({ a: 'all', n: 'attention', w: 'working', d: 'read', v: 'archived' } as const))
     screen.key(key, () => { if (!searching) { filter = value; notice = ''; render(); } });
+  for (const key of ['x', 'u']) screen.key(key, () => {
+    if (searching) return;
+    const agent = rows[(list as blessed.Widgets.ListElement & { selected: number }).selected];
+    if (!agent) return;
+    try {
+      archive.set(agent.id, key === 'x');
+      notice = `${clean(agent.title)}: ${key === 'x' ? 'archived' : 'restored'} locally`;
+    } catch (error) { notice = `Could not save archive: ${clean(String(error))}`; }
+    render();
+  });
   screen.key('escape', () => { if (!searching) { query = ''; filter = 'all'; render(); } });
   screen.key('/', () => {
     if (searching) return;

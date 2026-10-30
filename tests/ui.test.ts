@@ -7,6 +7,7 @@ import { dashboard } from '../src/ui';
 import { DesktopObserver } from '../src/observer';
 import { ReadState } from '../src/read-state';
 import type { Agent } from '../src/model';
+import { ArchiveState } from '../src/archive-state';
 
 test('terminal renders attention, name, directory, filters and read acknowledgement without Electron', () => {
   const root = mkdtempSync('/tmp/tcm-ui-');
@@ -45,6 +46,22 @@ test('terminal renders attention, name, directory, filters and read acknowledgem
     key('w');
     assert.match(screenshot(), /Working example/);
     assert.doesNotMatch(screenshot(), /Waiting example/);
+    key('a');
+    key('n');
+    key('x');
+    assert.doesNotMatch(screenshot(), /! WAITING/);
+    assert.match(screenshot(), /0 need attention/);
+    assert.equal(new ArchiveState(join(root, 'archive.json')).has(waiting.id), true);
+    observer.emit('update');
+    key('n');
+    assert.match(screenshot(), /No sessions match/);
+    key('v');
+    assert.match(screenshot(), /ARCHIVED locally/);
+    assert.match(screenshot(), /Waiting example/);
+    key('u');
+    assert.match(screenshot(), /No sessions match/);
+    assert.equal(new ArchiveState(join(root, 'archive.json')).has(waiting.id), false);
+    assert.equal(waiting.archived, false, 'source session was not modified');
     key('a');
     output.columns = 80; output.rows = 24;
     ui.screen.program.cols = 80; ui.screen.program.rows = 24;

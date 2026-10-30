@@ -22,6 +22,9 @@ Use a terminal at least 80 columns wide and 24 rows high. Session names, working
 | w | Show working sessions |
 | d | Show items marked read locally |
 | a | Show all sessions |
+| x | Archive the selected session locally |
+| v | Show locally archived sessions |
+| u | Restore the selected archived session |
 | / | Search session name, directory, or ID |
 | Esc | Clear search and return to all sessions |
 | q / Ctrl-C | Quit |
@@ -42,6 +45,8 @@ Use a terminal at least 80 columns wide and 24 rows high. Session names, working
 Pressing **r** does not approve anything, send a message, set a Codex read receipt, or change the actual `WAITING` status. It removes the current item from the attention view. A new request or turn returns to attention; observing work resume also clears the old acknowledgement. A temporary disconnect preserves acknowledgements. An item without a stable request/turn identity cannot be safely marked read.
 
 Only session IDs and attention identities are stored, in `~/.local/state/tui-codex-monitor/read.json` (or under `XDG_STATE_HOME`), with private file permissions. No prompts, responses, or tool arguments are persisted. Separate simultaneous dashboard instances should be avoided because they share this small acknowledgement file.
+
+Press **x** to archive a session in this dashboard. Archived sessions are excluded from the normal views and their working/attention/read/unknown counts. Press **v** to view the archive and **u** to restore a session. This is a persistent local archive, stored as session IDs in `archive.json` beside `read.json`; it never changes Codex's archive flag or stops an agent. Archived sessions stay hidden through new activity until you restore them.
 
 Activity uses the latest known turn start or observed runtime/request/turn-state change, with catalog update time as a labelled fallback. It is not a token-by-token activity clock. A periodic refresh does not count as activity.
 
