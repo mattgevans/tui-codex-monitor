@@ -127,7 +127,8 @@ function project(id: string, transcript: TranscriptState | undefined, live: Live
   const attentionKey = attention ? identity : null;
   return {
     id: `claude:${id}`, provider: 'claude', externalId: id,
-    title: record?.title || transcript?.title || terminal?.name || `${directory ? basename(directory) : 'Claude'} · ${id.slice(0, 8)}`,
+    title: (record?.titleSource === 'user' ? record.title : null) || transcript?.title || record?.title ||
+      terminal?.name || `${directory ? basename(directory) : 'Claude'} · ${id.slice(0, 8)}`,
     directory, runtime, status: runtime === 'WORKING' ? 'running' : attention ? 'review' : runtime === 'IDLE' ? 'read' : 'unknown',
     detail, evidence: live ? 'live' : runtime === 'UNKNOWN' ? 'unavailable' : 'history',
     attentionKey, attentionToken: attentionKey ? JSON.stringify(['claude', runtime, attentionKey]) : null,

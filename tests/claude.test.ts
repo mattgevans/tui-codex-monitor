@@ -112,6 +112,91 @@ test('Claude process registry overrides logs, distinguishes approval, idle and b
   assert.equal(readLiveProcesses(join(f.config, 'sessions'), () => true).terminal.size, 0);
 });
 
+test('Claude generated session names replace directory/ID and process-name fallbacks and refresh without activity changes', t => {
+  const f = fixture();
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  const cases = [
+    ['platform', 'Improve platform deployment'],
+    ['productivity', 'Organize weekly planning'],
+    ['proj-cover', 'Update cover letter workflow'],
+  ];
+  for (const [index, [directory, title]] of cases.entries()) {
+    const sessionId = `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`;
+    const project = join(f.config, 'projects', `-work-${directory}`);
+    mkdirSync(project);
+    writeFileSync(join(project, `${sessionId}.jsonl`), [
+      f.event('assistant', { sessionId, cwd: `/work/${directory}`, message: { stop_reason: 'end_turn', content: 'SECRET RESPONSE' } }),
+      // Generated title records have no timestamp and must not be treated as activity.
+      { type: 'ai-title', sessionId, aiTitle: title },
+    ].map(event => JSON.stringify(event) + '\n').join(''));
+  }
+  f.proc({ name: 'platform-ce', cwd: '/work/platform', status: 'idle' });
+  f.observer.refresh();
+  assert.deepEqual(f.observer.agents.map(agent => agent.title).sort(), cases.map(([, title]) => title).sort());
+  const before = f.observer.agents.find(agent => agent.externalId === id)!;
+  appendFileSync(join(f.config, 'projects', '-work-platform', `${id}.jsonl`),
+    JSON.stringify({ type: 'ai-title', sessionId: id, aiTitle: 'Updated platform deployment' }) + '\n');
+  f.observer.refresh();
+  const after = f.observer.agents.find(agent => agent.externalId === id)!;
+  assert.equal(after.title, 'Updated platform deployment');
+  assert.equal(after.runtime, before.runtime);
+  assert.equal(after.activityAt, before.activityAt);
+  assert.equal(after.attentionToken, before.attentionToken);
+  assert.doesNotMatch(JSON.stringify(f.observer.agents), /SECRET/);
+});
+
+test('Claude manual names beat later generated names; malformed and unfinished names do not replace them', t => {
+  const f = fixture();
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  f.append('assistant', { message: { stop_reason: 'end_turn' } });
+  f.append('ai-title', { aiTitle: 'Initial generated name', timestamp: undefined });
+  f.append('custom-title', { customTitle: 'My chosen session name', timestamp: undefined });
+  f.append('ai-title', { aiTitle: 'Later generated name', timestamp: undefined });
+  f.append('custom-title', { customTitle: '   ' });
+  f.append('custom-title', { customTitle: 123 });
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].title, 'My chosen session name');
+  const before = f.observer.agents[0];
+  const pending = JSON.stringify({ type: 'custom-title', sessionId: id, customTitle: 'Renamed session' });
+  appendFileSync(f.path, pending);
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].title, before.title);
+  appendFileSync(f.path, '\n');
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].title, 'Renamed session');
+  assert.equal(f.observer.agents[0].attentionToken, before.attentionToken);
+});
+
+test('Claude legacy title metadata without sessionId is scoped to its transcript and ignores unrelated title fields', t => {
+  const f = fixture();
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  f.append('assistant', { message: { stop_reason: 'end_turn' } });
+  f.append('ai-title', { sessionId: undefined, aiTitle: 'Legacy generated name' });
+  f.append('ai-title', { sessionId: otherId, aiTitle: 'Wrong session name' });
+  f.append('ai-title', { isSidechain: true, aiTitle: 'Subagent name' });
+  f.append('progress', { aiTitle: 'Not title metadata', data: { customTitle: 'SECRET TOOL ARGUMENT' } });
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].title, 'Legacy generated name');
+  f.append('custom-title', { sessionId: undefined, customTitle: 'Legacy manual name' });
+  f.append('ai-title', { aiTitle: 'Later generated name' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].title, 'Legacy manual name');
+  assert.doesNotMatch(JSON.stringify(f.observer.agents), /SECRET/);
+});
+
+test('Claude transcript titles replace automatic desktop titles while preserving manual desktop names', t => {
+  const f = fixture();
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  f.append('assistant', { message: { stop_reason: 'end_turn' } });
+  f.append('ai-title', { aiTitle: 'Actual Claude session name' });
+  f.record({ title: 'platform-ce', titleSource: 'auto' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].title, 'Actual Claude session name');
+  f.record({ title: 'My desktop session name', titleSource: 'user' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].title, 'My desktop session name');
+});
+
 test('Claude desktop metadata is deduplicated with CLI sessions and excludes source archives', t => {
   const f = fixture();
   t.after(() => rmSync(f.root, { recursive: true, force: true }));
@@ -167,6 +252,7 @@ test('Claude bounded reads preserve metadata and find explicit completion beyond
   f.append('file-history-snapshot', { snapshot: 'SECRET'.repeat(600_000) });
   f.append('assistant', { uuid: 'assistant-final', message: { stop_reason: null } });
   f.append('system', { uuid: undefined, subtype: 'turn_duration' });
+  f.append('ai-title', { aiTitle: 'Generated name at the tail', timestamp: undefined });
   const reader = new TranscriptReader();
   const state = reader.read(f.path, id)!;
   assert.equal(state.title, 'Large session');

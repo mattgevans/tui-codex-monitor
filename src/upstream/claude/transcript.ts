@@ -26,6 +26,8 @@ export class TranscriptReader {
       if (cached?.signature === signature) return cached.state;
       const prefixSize = Math.min(stat.size, 1024 * 1024);
       const state: TranscriptState = { directory: null, title: null, runtime: 'UNKNOWN', identity: null };
+      let customTitle: string | null = null;
+      let aiTitle: string | null = null;
       let matched = false;
       const scan = (offset: number, size: number, skipFirst: boolean) => {
         const buffer = Buffer.alloc(size);
@@ -36,11 +38,21 @@ export class TranscriptReader {
         for (const line of lines) {
           let event;
           try { event = JSON.parse(line); } catch { continue; }
-          if (event?.sessionId !== sessionId || event.isSidechain === true) continue;
+          if (event?.isSidechain === true) continue;
+          // Older title records omit sessionId; the enclosing transcript supplies it.
+          // Only top-level title metadata is a name, never fields inside messages/tools.
+          if (event?.sessionId === sessionId || event?.sessionId === undefined) {
+            const value = event?.type === 'custom-title' ? event.customTitle :
+              event?.type === 'ai-title' ? event.aiTitle : undefined;
+            if (typeof value === 'string' && value.trim()) {
+              const title = value.trim().slice(0, 500);
+              if (event.type === 'custom-title') customTitle = title;
+              else aiTitle = title;
+            }
+          }
+          if (event?.sessionId !== sessionId) continue;
           matched = true;
           if (typeof event.cwd === 'string' && event.cwd.startsWith('/')) state.directory = event.cwd;
-          if (event.type === 'custom-title' && typeof event.customTitle === 'string')
-            state.title = event.customTitle.slice(0, 500);
           const at = Date.parse(event.timestamp);
           if (!Number.isFinite(at)) continue;
           state.createdAt = Math.min(state.createdAt ?? at, at);
@@ -70,6 +82,8 @@ export class TranscriptReader {
         state.runtime = 'UNKNOWN'; state.identity = null; state.activityAt = undefined;
         scan(offset, stat.size - offset, offset > 0);
       }
+      // A later generated title must not replace a manual /rename title.
+      state.title = customTitle || aiTitle;
       const result = matched ? state : undefined;
       this.cache.set(key, { signature, state: result });
       return result;

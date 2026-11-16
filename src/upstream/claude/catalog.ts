@@ -13,6 +13,7 @@ export interface DesktopRecord {
   sessionId: string;
   cliSessionId: string | null;
   title: string | null;
+  titleSource?: 'user' | 'auto';
   cwd: string | null;
   archived: boolean;
   createdAt: number | null;
@@ -78,6 +79,7 @@ export function readDesktopRecords(root: string): DesktopRecord[] {
           ? raw.cliSessionId
           : null,
       title: text(raw.title)?.slice(0, 500) ?? null,
+      titleSource: raw.titleSource === 'user' || raw.titleSource === 'auto' ? raw.titleSource : undefined,
       cwd: text(raw.cwd),
       archived: raw.isArchived === true,
       createdAt: time(raw.createdAt),
