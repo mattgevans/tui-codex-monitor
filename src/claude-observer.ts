@@ -14,6 +14,12 @@ export interface ClaudeObserverOptions {
   processAlive?: (pid: number) => boolean;
 }
 
+type ExitReason = 'process-ended' | 'session-changed';
+interface ExitedProcess {
+  process: LiveProcess | TerminalProcess;
+  reason: ExitReason;
+}
+
 function entries(path: string) {
   try { return readdirSync(path, { withFileTypes: true }); }
   catch (error) {
@@ -30,7 +36,7 @@ export class ClaudeObserver extends EventEmitter {
   readonly desktopDir: string;
   private reader = new TranscriptReader();
   private knownProcesses = new Map<string, LiveProcess | TerminalProcess>();
-  private confirmedExits = new Set<string>();
+  private confirmedExits = new Map<string, ExitReason>();
   private timer?: NodeJS.Timeout;
 
   constructor(private options: ClaudeObserverOptions = {}) {
@@ -53,19 +59,28 @@ export class ClaudeObserver extends EventEmitter {
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       const alive = this.options.processAlive ?? processAlive;
       const live = readLiveProcesses(join(this.configDir, 'sessions'), alive);
+      const currentSessions = new Map<number, Set<string>>();
       for (const registry of [live.desktop, live.terminal])
         for (const [id, process] of registry) {
+          const sessions = currentSessions.get(process.pid) ?? new Set<string>();
+          sessions.add(id);
+          currentSessions.set(process.pid, sessions);
           this.knownProcesses.set(id, process);
           this.confirmedExits.delete(id);
         }
       for (const registry of [live.exitedDesktop, live.exitedTerminal])
         for (const [id, process] of registry)
           if (!this.knownProcesses.has(id)) this.knownProcesses.set(id, process);
-      const exited = new Map<string, LiveProcess | TerminalProcess>();
+      const exited = new Map<string, ExitedProcess>();
       for (const [id, process] of this.knownProcesses) {
-        if (!live.desktop.has(id) && !live.terminal.has(id) && (this.confirmedExits.has(id) || !alive(process.pid))) {
-          this.confirmedExits.add(id);
-          exited.set(id, process);
+        if (live.desktop.has(id) || live.terminal.has(id)) continue;
+        const owners = currentSessions.get(process.pid);
+        let reason = this.confirmedExits.get(id);
+        if (!reason && owners && !owners.has(id)) reason = 'session-changed';
+        if (!reason && !alive(process.pid)) reason = 'process-ended';
+        if (reason) {
+          this.confirmedExits.set(id, reason);
+          exited.set(id, { process, reason });
         }
       }
       const transcripts = new Map<string, TranscriptState>();
@@ -90,7 +105,7 @@ export class ClaudeObserver extends EventEmitter {
         project(record.sessionId, record.cliSessionId ? transcripts.get(record.cliSessionId) : undefined,
           live.desktop.get(record.sessionId) ?? (record.cliSessionId ? live.terminal.get(record.cliSessionId) : undefined), record, now,
           exited.get(record.sessionId) ?? (record.cliSessionId ? exited.get(record.cliSessionId) : undefined)));
-      const exitedTerminal = [...exited].filter(([, process]) => 'sessionId' in process).map(([id]) => id);
+      const exitedTerminal = [...exited].filter(([, exit]) => 'sessionId' in exit.process).map(([id]) => id);
       for (const id of new Set([...transcripts.keys(), ...live.terminal.keys(), ...exitedTerminal])) {
         if (!claimed.has(id)) this.agents.push(project(id, transcripts.get(id), live.terminal.get(id), undefined, now, exited.get(id)));
       }
@@ -112,8 +127,8 @@ export class ClaudeObserver extends EventEmitter {
 }
 
 function project(id: string, transcript: TranscriptState | undefined, live: LiveProcess | undefined,
-  record: DesktopRecord | undefined, now: number, exited?: LiveProcess | TerminalProcess): Agent {
-  const terminal = (live ?? exited) as TerminalProcess | undefined;
+  record: DesktopRecord | undefined, now: number, exited?: ExitedProcess): Agent {
+  const terminal = (live ?? exited?.process) as TerminalProcess | undefined;
   const directory = record?.cwd ?? transcript?.directory ?? terminal?.cwd ?? null;
   let runtime: Status = transcript?.runtime ?? 'UNKNOWN';
   let identity = transcript?.identity ?? null;
@@ -143,8 +158,11 @@ function project(id: string, transcript: TranscriptState | undefined, live: Live
       detail = 'Claude process is open; no supported turn status is available';
     }
   } else if (exited) {
-    runtime = 'EXITED'; identity = null; detail = 'Claude session exited; its recorded process is no longer running';
-    activityAt = Math.max(activityAt ?? 0, exited.statusUpdatedAt ?? 0) || undefined;
+    runtime = 'EXITED'; identity = null;
+    detail = exited.reason === 'session-changed'
+      ? 'Conversation exited; Claude switched to another session in the same process'
+      : 'Claude session exited; its recorded process is no longer running';
+    activityAt = Math.max(activityAt ?? 0, exited.process.statusUpdatedAt ?? 0) || undefined;
   }
   if ((!live || live.status === 'unknown') && ['WORKING', 'WAITING'].includes(runtime) && (!activityAt || now - activityAt > 120_000)) {
     runtime = 'UNKNOWN'; identity = null; detail = 'Claude session log is stale; no live process state';

@@ -152,6 +152,95 @@ test('Claude completed and active sessions become EXITED after their observed pr
   assert.equal(f.observer.agents[0].runtime, 'EXITED', 'a dead stale registry also proves exit');
 });
 
+test('Claude clear exits the old conversation while its process continues with a renamed new session', t => {
+  const f = fixture();
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  f.append('custom-title', { customTitle: 'Original chat' });
+  f.append('assistant', { message: { stop_reason: 'end_turn' } });
+  f.proc({ status: 'idle' });
+  f.observer.refresh();
+  const previous = f.observer.agents[0];
+  const read = new ReadState(join(f.root, 'read.json'));
+  read.toggle(previous);
+  // /clear creates a different transcript but keeps the same live OS process.
+  const nextPath = join(f.project, `${otherId}.jsonl`);
+  writeFileSync(nextPath, JSON.stringify({ type: 'custom-title', sessionId: otherId, customTitle: 'Original chat' }) + '\n');
+  f.proc({ sessionId: otherId, status: 'idle' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents.length, 2);
+  const old = f.observer.agents.find(agent => agent.externalId === id)!;
+  const current = f.observer.agents.find(agent => agent.externalId === otherId)!;
+  assert.equal(old.runtime, 'EXITED');
+  assert.equal(old.status, 'read');
+  assert.equal(old.title, 'Original chat');
+  assert.equal(old.activityAt, previous.activityAt, 'observing the switch must not fabricate turn activity');
+  assert.equal(old.attentionToken, null);
+  assert.equal(old.awaitingInput, false);
+  assert.match(old.detail, /switched to another session/);
+  assert.equal(current.runtime, 'IDLE', 'the new conversation remains open before its first prompt');
+  assert.equal(current.title, 'Original chat', 'equal inherited titles must not merge different IDs');
+  appendFileSync(nextPath, JSON.stringify({ type: 'custom-title', sessionId: otherId, customTitle: 'Renamed after clear' }) + '\n');
+  f.proc({ sessionId: otherId, status: 'busy', name: 'Renamed after clear' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents.length, 2);
+  assert.equal(f.observer.agents.find(agent => agent.externalId === id)?.runtime, 'EXITED');
+  assert.equal(f.observer.agents.find(agent => agent.externalId === otherId)?.title, 'Renamed after clear');
+  const snapshot = statusSnapshot(f.observer, read, new ArchiveState(join(f.root, 'archive.json')));
+  assert.equal(snapshot.counts.statuses.EXITED, 1);
+  assert.equal(snapshot.counts.statuses.WORKING, 1);
+  assert.equal(snapshot.counts.needsAttention, 0);
+  assert.equal(snapshot.sessions.find(session => session.id === otherId)?.readLocally, false);
+  rmSync(join(f.config, 'sessions', '123.json'));
+  f.observer.refresh();
+  assert.equal(f.observer.agents.find(agent => agent.externalId === id)?.runtime, 'EXITED', 'registry gaps must not revive a cleared conversation');
+});
+
+test('Claude repeated clears exit each previous session and resuming an old session reopens it', t => {
+  const f = fixture();
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  const thirdId = '00000000-0000-4000-8000-000000000003';
+  for (const sessionId of [id, otherId, thirdId]) {
+    writeFileSync(join(f.project, `${sessionId}.jsonl`), JSON.stringify(f.event('custom-title', {
+      sessionId, customTitle: `Chat ${sessionId.slice(-1)}`,
+    })) + '\n');
+    f.proc({ sessionId, status: undefined, statusUpdatedAt: undefined });
+    f.observer.refresh();
+  }
+  assert.equal(f.observer.agents.find(agent => agent.externalId === id)?.runtime, 'EXITED');
+  assert.equal(f.observer.agents.find(agent => agent.externalId === otherId)?.runtime, 'EXITED');
+  assert.equal(f.observer.agents.find(agent => agent.externalId === thirdId)?.runtime, 'UNKNOWN');
+  f.proc({ sessionId: id, status: 'busy' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents.length, 3);
+  assert.equal(f.observer.agents.find(agent => agent.externalId === id)?.runtime, 'WORKING');
+  assert.equal(f.observer.agents.find(agent => agent.externalId === otherId)?.runtime, 'EXITED');
+  assert.equal(f.observer.agents.find(agent => agent.externalId === thirdId)?.runtime, 'EXITED');
+});
+
+test('Claude new sessions in the same directory do not exit another live process or infer a clear from a rename', t => {
+  const f = fixture();
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  f.append('assistant', { message: { stop_reason: 'end_turn' } });
+  f.proc({ status: 'idle', name: 'Shared title' });
+  f.observer.refresh();
+  f.append('custom-title', { customTitle: 'Renamed without clear' });
+  f.proc({ status: 'idle', name: 'Renamed without clear' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents.length, 1);
+  assert.equal(f.observer.agents[0].runtime, 'DONE');
+  rmSync(join(f.config, 'sessions', '123.json'));
+  writeFileSync(join(f.config, 'sessions', '456.json'), JSON.stringify({ pid: 456, sessionId: otherId,
+    entrypoint: 'cli', kind: 'interactive', status: 'busy', cwd: '/tmp/project', name: 'Renamed without clear' }));
+  f.observer.refresh();
+  assert.equal(f.observer.agents.find(agent => agent.externalId === id)?.runtime, 'DONE', 'matching directory/title is not a session switch');
+  assert.equal(f.observer.agents.find(agent => agent.externalId === otherId)?.runtime, 'WORKING');
+  // Reopening the original conversation in another process keeps it live too.
+  f.proc({ sessionId: id, status: 'busy' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents.find(agent => agent.externalId === id)?.runtime, 'WORKING');
+  assert.equal(f.observer.agents.find(agent => agent.externalId === otherId)?.runtime, 'WORKING');
+});
+
 test('Claude identity-only registry entries detect terminal exits without inventing a live turn status', t => {
   let running = true;
   const f = fixture(() => running);
