@@ -12,6 +12,38 @@ import { FrameDecoder, encodeFrame } from '../src/upstream/codex/transport';
 import { projectConversation, sessionFromProjection, patchProjection, type Projection } from '../src/upstream/codex/projection';
 
 const threadId = 'test-desktop-thread';
+test('missing Codex store stays offline and starts observing if the store appears later', () => {
+  const root = mkdtempSync('/tmp/tcm-optional-codex-');
+  const home = join(root, '.codex');
+  const observer = new DesktopObserver(home, () => new Set());
+  let connections = 0;
+  observer.transport.start = () => { connections++; };
+  try {
+    observer.start();
+    observer.start();
+    assert.equal(observer.health.available, false);
+    assert.equal(observer.health.state, 'offline');
+    assert.equal(observer.health.message, 'No local Codex sessions found');
+    assert.equal(connections, 0, 'do not probe a missing provider socket');
+    mkdirSync(home);
+    const path = join(home, 'state_1.sqlite');
+    const db = new DatabaseSync(path);
+    db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,title TEXT,cwd TEXT,source TEXT,archived INTEGER,updated_at INTEGER)');
+    db.close();
+    observer.refresh();
+    observer.refresh();
+    assert.equal(observer.health.available, true);
+    assert.equal(connections, 1, 'connect once when the provider becomes available');
+    rmSync(path);
+    observer.refresh();
+    assert.equal(observer.health.available, true, 'losing an existing catalog must still report an error');
+    assert.equal(observer.health.state, 'degraded');
+  } finally {
+    observer.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 const base = { id: `codex:${threadId}`, provider: 'codex' as const, externalId: threadId,
   title: 'Synthetic task', directory: '/tmp/project', status: 'unknown' as const,
   detail: '', updatedAt: 1000, observedAt: 1000, evidence: 'unavailable' as const,

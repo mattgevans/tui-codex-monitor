@@ -9,6 +9,8 @@ import { ReadState } from '../src/read-state';
 import type { Agent } from '../src/model';
 import { ArchiveState } from '../src/archive-state';
 import type { Widgets } from 'blessed';
+import { EventEmitter } from 'node:events';
+import type { SessionObserver } from '../src/monitor-observer';
 
 test('terminal renders attention, name, directory, filters and read acknowledgement without Electron', () => {
   const root = mkdtempSync('/tmp/tcm-ui-');
@@ -68,7 +70,7 @@ test('terminal renders attention, name, directory, filters and read acknowledgem
     ui.screen.program.cols = 80; ui.screen.program.rows = 24;
     ui.screen.realloc(); ui.screen.emit('resize');
     view = screenshot();
-    assert.match(view, /CODEX MONITOR/);
+    assert.match(view, /SESSION MONITOR/);
     assert.match(view, /Directory: \/tmp\/example-repository/);
     assert.match(view, /mark read\/unread/);
 
@@ -90,6 +92,50 @@ test('terminal renders attention, name, directory, filters and read acknowledgem
     assert.match(screenshot(), /Session A  \[WORKING\]/);
     key('x');
     assert.match(screenshot(), /No sessions match/);
+  } finally {
+    ui.close(); input.destroy(); output.destroy(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('mixed-provider terminal labels and local actions stay separate at 80 columns', () => {
+  const root = mkdtempSync('/tmp/tcm-mixed-ui-');
+  const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode() {} });
+  const output = Object.assign(new PassThrough(), { isTTY: true, columns: 80, rows: 24 });
+  output.on('data', () => {});
+  const observer: SessionObserver = Object.assign(new EventEmitter(), {
+    agents: ['claude', 'codex'].map((provider): Agent => ({
+      id: `${provider}:same-session`, externalId: 'same-session', provider: provider as Agent['provider'],
+      title: `${provider} task`, directory: '/tmp/shared-repository', runtime: 'DONE', status: 'review',
+      detail: 'Finished turn', evidence: 'history', attentionKey: 'result-1', attentionToken: 'result-1',
+      updatedAt: 1000, observedAt: 1000, archived: false,
+    })),
+    health: { state: 'offline' as const, message: 'Reading local session history', lastObservedAt: 1000 },
+    start() {}, stop() {},
+  });
+  const read = new ReadState(join(root, 'read.json'));
+  const ui = dashboard(observer, { input, output, terminal: 'xterm-256color' }, read);
+  const screenshot = () => String(ui.screen.screenshot()).replace(/\x1b\[[0-9;]*m/g, '');
+  const key = (name: string) => ui.screen.emit(`key ${name}`, name, { name });
+  try {
+    assert.match(screenshot(), /DONE\s+claude/);
+    assert.match(screenshot(), /DONE\s+codex/);
+    assert.match(screenshot(), /Directory: \/tmp\/shared-repository/);
+    key('r');
+    assert.equal(read.isRead(observer.agents[0]), true);
+    assert.equal(read.isRead(observer.agents[1]), false);
+    key('d');
+    key('x');
+    const archive = new ArchiveState(join(root, 'archive.json'));
+    assert.equal(archive.has(observer.agents[0].id), true);
+    assert.equal(archive.has(observer.agents[1].id), false);
+    key('a');
+    assert.match(screenshot(), /codex task/);
+    assert.doesNotMatch(screenshot(), /claude task/);
+    key('v');
+    assert.match(screenshot(), /claude task/);
+    key('u');
+    assert.equal(new ArchiveState(join(root, 'archive.json')).has(observer.agents[0].id), false);
+    assert.equal(archive.has(observer.agents[1].id), false);
   } finally {
     ui.close(); input.destroy(); output.destroy(); rmSync(root, { recursive: true, force: true });
   }

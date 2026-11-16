@@ -1,8 +1,10 @@
+import { openRollouts } from './upstream/codex/processes';
+import { RolloutReader } from './upstream/codex/rollout';
 import { EventEmitter } from 'node:events';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { ProviderHealth } from './shared/types';
-import { readCatalog } from './upstream/codex/catalog';
+import { readCatalog, MissingCatalogError } from './upstream/codex/catalog';
 import { CodexTransport } from './upstream/codex/transport';
 import { LineageReader } from './upstream/lineage';
 import { patchProjection, projectConversation, sessionFromProjection, type Projection } from './upstream/codex/projection';
@@ -17,13 +19,17 @@ export class DesktopObserver extends EventEmitter {
   health: ProviderHealth = { provider: 'codex', state: 'connecting', message: 'Connecting to Codex desktop', lastObservedAt: null };
   private live = new Map<string, Live>();
   private lineage = new LineageReader();
+  private rollouts = new RolloutReader();
+  private openPaths?: Set<string>;
   private timer?: NodeJS.Timeout;
+  private running = false;
+  private transportStarted = false;
   private connected = false;
   private protocolError: string | null = null;
   private catalogError: string | null = null;
   private resyncAt = new Map<string, number>();
   private tracked: string[] = [];
-  constructor(readonly home = process.env.CODEX_HOME || join(homedir(), '.codex')) {
+  constructor(readonly home = process.env.CODEX_HOME || join(homedir(), '.codex'), private readonly inspectProcesses = openRollouts) {
     super();
     this.transport = new CodexTransport(join(home, 'ipc', 'ipc.sock'));
     this.transport.on('ready', () => { this.connected = true; this.publish(); });
@@ -36,23 +42,32 @@ export class DesktopObserver extends EventEmitter {
     this.transport.on('message', message => this.receive(message));
   }
   start() {
+    if (this.running) return;
+    this.running = true;
     this.refresh();
-    this.transport.start();
     this.timer = setInterval(() => this.refresh(), 1000);
   }
   refresh() {
     try {
       const rows = readCatalog(this.home, [], this.lineage);
       this.catalogError = null;
+      this.health.available = true;
+      this.openPaths = this.inspectProcesses();
       this.tracked = rows.map(row => row.externalId);
       for (const id of this.live.keys()) if (!this.tracked.includes(id)) this.live.delete(id);
+      this.rollouts.retain(rows.filter(r => r.rolloutPath).map(r => `${r.externalId}\0${r.rolloutPath}`));
       this.agents = rows.map(row => {
         const live = this.live.get(row.externalId);
-        return live ? this.project(row, live.state, live.activityAt) : { ...row, runtime: 'UNKNOWN', attentionToken: null };
+        return live ? this.project(row, live.state, live.activityAt) : this.fallback(row);
       });
       this.transport.track(this.tracked);
+      if (this.running && !this.transportStarted) {
+        this.transportStarted = true;
+        this.transport.start();
+      }
       this.publish();
     } catch (error) {
+      this.health.available = this.health.available === true || !(error instanceof MissingCatalogError);
       this.catalogError = error instanceof Error ? error.message : String(error);
       this.publish();
     }
@@ -62,16 +77,30 @@ export class DesktopObserver extends EventEmitter {
     if (activityAt) session.activityAt = Math.max(session.activityAt || 0, activityAt);
     return { ...session, runtime: classify(state), attentionToken: attentionToken(session, state) };
   }
+  private fallback(row: ReturnType<typeof readCatalog>[number]): Agent {
+    const log = row.rolloutPath && this.rollouts.read(row.rolloutPath, row.externalId, Date.now(), true);
+    if (!log) return { ...row, runtime: 'UNKNOWN', status: 'unknown', evidence: 'unavailable',
+      awaitingInput: false, attentionToken: null, detail: 'No current desktop or session-log state' };
+    const agent = this.project(row, log.state, log.activityAt);
+    if (log.terminal && this.openPaths && !this.openPaths.has(row.rolloutPath!)) {
+      return { ...agent, runtime: 'EXITED', status: 'read', evidence: 'history',
+        awaitingInput: false, attentionToken: null, terminalResumeAllowed: true,
+        detail: 'Codex CLI exited; no process holds this session log open' };
+    }
+    if (log.active && Date.now() - log.activityAt > 120_000 && !this.openPaths?.has(row.rolloutPath!))
+      return { ...row, runtime: 'UNKNOWN', status: 'unknown', evidence: 'unavailable',
+        awaitingInput: false, attentionToken: null, detail: 'Session log is stale; process state unavailable' };
+    return { ...agent, evidence: 'history', status: log.active ? 'running' : 'review',
+      detail: log.active ? 'Turn running in local session log' : 'Turn finished in local session log' };
+  }
   private invalidate(id?: string) {
-    this.agents = this.agents.map(a => !id || a.externalId === id ? {
-      ...a, runtime: 'UNKNOWN', status: 'unknown', evidence: 'unavailable',
-      awaitingInput: false, attentionToken: null, detail: 'Live desktop state unavailable',
-    } : a);
+    this.agents = this.agents.map(a => !id || a.externalId === id ? this.fallback(a) : a);
   }
   private publish(offlineMessage = 'Codex desktop disconnected') {
     this.health = { ...this.health,
-      state: this.catalogError || this.protocolError ? 'degraded' : this.connected ? 'live' : 'offline',
-      message: this.catalogError || this.protocolError || (this.connected ? 'Connected to Codex desktop · read-only' : offlineMessage),
+      state: this.health.available === false ? 'offline' : this.catalogError || this.protocolError ? 'degraded' : this.connected ? 'live' : 'offline',
+      message: this.health.available === false ? 'No local Codex sessions found' :
+        this.catalogError || this.protocolError || (this.connected ? 'Connected to Codex desktop · read-only' : offlineMessage),
     };
     this.emit('update');
   }
@@ -138,8 +167,10 @@ export class DesktopObserver extends EventEmitter {
     this.publish();
   }
   stop() {
+    this.running = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     this.transport.stop();
+    this.transportStarted = false;
   }
 }

@@ -28,7 +28,7 @@ export class ReadState {
   reconcile(agents: Agent[]) {
     const next = { ...this.entries };
     for (const agent of agents) {
-      if (agent.evidence !== 'live') continue;
+      if (agent.evidence === 'unavailable') continue;
       if (next[agent.id] && next[agent.id] !== agent.attentionToken) delete next[agent.id];
     }
     if (JSON.stringify(next) !== JSON.stringify(this.entries)) this.save(next);

@@ -18,6 +18,8 @@ export interface Session {
   status: SessionStatus;
   detail: string;
   updatedAt: number;
+  /** Read-only local event log used when no desktop owner broadcasts state. */
+  rolloutPath?: string;
   createdAt?: number;
   /** Source-owned ancestry. Missing means unavailable; null means no recorded parent. */
   lineage?: { parentId: string | null };
@@ -48,6 +50,8 @@ export interface Session {
 
 export interface ProviderHealth {
   provider: ProviderId;
+  /** false when an optional provider has no local store installed. */
+  available?: boolean;
   state: 'connecting' | 'live' | 'degraded' | 'offline';
   message: string;
   lastObservedAt: number | null;

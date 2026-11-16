@@ -1,13 +1,13 @@
 import blessed from 'blessed';
-import { DesktopObserver } from './observer';
+import type { SessionObserver } from './monitor-observer';
 import { age, clean, needsAttention, type Agent } from './model';
 import { ReadState } from './read-state';
 import { ArchiveState } from './archive-state';
 import { dirname, join } from 'node:path';
 
-export function dashboard(observer: DesktopObserver, screenOptions: blessed.Widgets.IScreenOptions = {}, read = new ReadState()) {
+export function dashboard(observer: SessionObserver, screenOptions: blessed.Widgets.IScreenOptions = {}, read = new ReadState()) {
   const archive = new ArchiveState(join(dirname(read.path), 'archive.json'));
-  const screen = blessed.screen({ smartCSR: true, title: 'Codex Monitor', fullUnicode: true, ...screenOptions });
+  const screen = blessed.screen({ smartCSR: true, title: 'Codex + Claude Monitor', fullUnicode: true, ...screenOptions });
   const background = '#101522';
   const header = blessed.box({ parent: screen, top: 0, left: 1, height: 4, width: '100%-2', tags: true, style: { fg: '#e1e9ff', bg: background } });
   const list = blessed.list({ parent: screen, top: 4, bottom: 8, left: 0, right: 0,
@@ -46,8 +46,8 @@ export function dashboard(observer: DesktopObserver, screenOptions: blessed.Widg
       detail.setContent([
         `${clean(agent.title)}  [${agent.runtime}${archive.has(agent.id) ? ' · ARCHIVED locally' : ''}${read.isRead(agent) ? ' · READ locally' : ''}]`,
         `Directory: ${clean(agent.directory || 'Unavailable')}`,
-        `${clean(agent.detail)} · ${agent.evidence === 'live' ? 'Live desktop state' : 'State unavailable'}`,
-        `Activity: ${new Date(agent.activityAt || agent.updatedAt).toLocaleString()}${agent.activityAt ? ' (turn / observed state change)' : ' (catalog updated)'} · ${agent.externalId}`,
+        `${clean(agent.detail)} · ${agent.evidence === 'live' ? 'Live provider state' : agent.evidence === 'history' ? 'Local session history' : 'State unavailable'}`,
+        `Activity: ${new Date(agent.activityAt || agent.updatedAt).toLocaleString()}${agent.activityAt ? ' (turn / observed state change)' : ' (catalog updated)'} · ${agent.id}`,
       ].join('\n'));
     }
   };
@@ -58,23 +58,28 @@ export function dashboard(observer: DesktopObserver, screenOptions: blessed.Widg
     const all = source.filter(a => !archive.has(a.id));
     rows = source.filter(a => filter === 'archived' ? archive.has(a.id) : !archive.has(a.id)).filter(a =>
       filter === 'attention' ? urgent(a) : filter === 'working' ? a.runtime === 'WORKING' : filter === 'read' ? read.isRead(a) : true,
-    ).filter(a => `${a.title} ${a.directory || ''} ${a.externalId}`.toLowerCase().includes(query.toLowerCase()))
+    ).filter(a => `${a.provider} ${a.title} ${a.directory || ''} ${a.externalId}`.toLowerCase().includes(query.toLowerCase()))
       .sort((a, b) => priority(a) - priority(b) || (b.activityAt || b.updatedAt) - (a.activityAt || a.updatedAt) || a.id.localeCompare(b.id));
     const width = Math.max(30, Number(screen.width) - 5);
-    const pathWidth = Math.max(8, Math.floor((width - 28) * .4));
-    const titleWidth = Math.max(8, width - pathWidth - 28);
+    const pathWidth = Math.max(8, Math.floor((width - 35) * .4));
+    const titleWidth = Math.max(8, width - pathWidth - 35);
     list.setItems(rows.map(a => {
       const acknowledged = read.isRead(a);
       const color = urgent(a) ? '#ffd47c' : a.runtime === 'WORKING' ? '#7ab8ff' : '#a9b8cf';
       const flag = acknowledged ? 'r' : urgent(a) ? '!' : a.runtime === 'WORKING' ? '▶' : '·';
       const directory = a.directory || '?';
-      const label = `${flag} ${fit(a.runtime, 7)} ${fit(a.title, titleWidth)} ${fitPath(directory, pathWidth)} ${age(a.activityAt || a.updatedAt).padStart(8)}`;
+      const label = `${flag} ${fit(a.runtime, 7)} ${fit(a.provider, 6)} ${fit(a.title, titleWidth)} ${fitPath(directory, pathWidth)} ${age(a.activityAt || a.updatedAt).padStart(8)}`;
       return `{${color}-fg}${label}{/${color}-fg}`;
     }));
     const index = rows.findIndex(a => a.id === selectedId);
     list.select(index >= 0 ? index : 0);
     const counts = `${all.filter(a => a.runtime === 'WORKING').length} working  ·  ${all.filter(urgent).length} need attention  ·  ${all.filter(a => read.isRead(a)).length} read  ·  ${all.filter(a => a.runtime === 'UNKNOWN').length} unknown`;
-    header.setContent(`{bold}{#7ab8ff-fg}CODEX MONITOR{/#7ab8ff-fg}{/bold}  ${counts}\n${clean(observer.health.message)}\nView: ${filter} · ${rows.length}/${source.length} sessions · ${source.length - all.length} archived${query ? ` · search: ${clean(query)}` : ''}  |  ! attention  r read locally  ▶ working\n  STATUS  SESSION NAME${' '.repeat(Math.max(1, titleWidth - 12))}WORKING DIRECTORY / REPOSITORY    ACTIVITY`);
+    const providerHealth = observer.health.providers;
+    const problem = providerHealth?.find(provider => provider.state === 'degraded' && provider.available !== false);
+    const healthLine = providerHealth ? providerHealth.map(provider =>
+      `${provider.provider}: ${provider.available === false ? 'not installed' : provider.state}`).join(' · ') +
+      (problem ? ` · ${problem.message}` : '') : observer.health.message;
+    header.setContent(`{bold}{#7ab8ff-fg}SESSION MONITOR{/#7ab8ff-fg}{/bold}  ${counts}\n${clean(healthLine)}\nView: ${filter} · ${rows.length}/${source.length} sessions · ${source.length - all.length} archived${query ? ` · search: ${clean(query)}` : ''}  |  ! attention  r read locally  ▶ working\n  STATUS  SOURCE SESSION NAME${' '.repeat(Math.max(1, titleWidth - 12))}WORKING DIRECTORY / REPOSITORY    ACTIVITY`);
     renderDetail();
     footer.setContent(`↑↓/jk · r mark read/unread · x archive · v archived · u restore · a all · n attention\n${notice || 'w working · d read · / search · Esc clear · q quit | Read/archive affect only this dashboard.'}`);
     rendering = false;

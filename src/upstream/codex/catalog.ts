@@ -8,11 +8,18 @@ import { LineageReader } from '../lineage';
 const PINNED_SECTION_ID = '01984de2-8f74-7c91-a3b2-5c5e937cf318';
 
 export const validThreadId = (id: string) => /^[a-zA-Z0-9][a-zA-Z0-9_-]{5,127}$/.test(id);
+export class MissingCatalogError extends Error {}
 export function findStateDatabase(home: string): string {
-  const names = readdirSync(home).filter((name) => /^state_\d+\.sqlite$/.test(name));
+  let entries: string[];
+  try { entries = readdirSync(home); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new MissingCatalogError('No local Codex session store found');
+    throw error;
+  }
+  const names = entries.filter((name) => /^state_\d+\.sqlite$/.test(name));
   names.sort((a, b) => Number(b.match(/\d+/)![0]) - Number(a.match(/\d+/)![0]));
   if (!names[0])
-    throw new Error('No Codex session database found. Open Codex and create a local task first.');
+    throw new MissingCatalogError('No Codex session database found. Open Codex and create a local task first.');
   return join(home, names[0]);
 }
 
@@ -87,6 +94,7 @@ export function readCatalog(
           externalId: String(row.id),
           title: String(row.name || row.title || 'Untitled Codex task').slice(0, 500),
           directory: row.cwd ? String(row.cwd) : null,
+          rolloutPath: typeof row.rollout_path === 'string' ? row.rollout_path : undefined,
           status: 'unknown',
           detail: 'Waiting for a live state from Codex',
           updatedAt: Number(row.updated_at_ms) || Number(row.updated_at) * 1000,

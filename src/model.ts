@@ -1,7 +1,7 @@
 import type { Session } from './shared/types';
 import { latestTurn, type Projection } from './upstream/codex/projection';
 
-export type Status = 'WORKING' | 'WAITING' | 'IDLE' | 'DONE' | 'ERROR' | 'UNKNOWN';
+export type Status = 'WORKING' | 'WAITING' | 'IDLE' | 'DONE' | 'ERROR' | 'EXITED' | 'UNKNOWN';
 export interface Agent extends Session { runtime: Status; attentionToken: string | null }
 
 export function classify(state: Projection): Status {
