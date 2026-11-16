@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import type { Agent, Status } from './model';
 import type { ProviderHealth } from './shared/types';
-import { readDesktopRecords, readLiveProcesses, validCliSessionId,
+import { readDesktopRecords, readLiveProcesses, validCliSessionId, processAlive,
   type DesktopRecord, type LiveProcess, type TerminalProcess } from './upstream/claude/catalog';
 import { TranscriptReader, type TranscriptState } from './upstream/claude/transcript';
 
@@ -29,6 +29,8 @@ export class ClaudeObserver extends EventEmitter {
   readonly configDir: string;
   readonly desktopDir: string;
   private reader = new TranscriptReader();
+  private knownProcesses = new Map<string, LiveProcess | TerminalProcess>();
+  private confirmedExits = new Set<string>();
   private timer?: NodeJS.Timeout;
 
   constructor(private options: ClaudeObserverOptions = {}) {
@@ -49,7 +51,23 @@ export class ClaudeObserver extends EventEmitter {
       let records: DesktopRecord[] = [];
       try { records = readDesktopRecords(this.desktopDir); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-      const live = readLiveProcesses(join(this.configDir, 'sessions'), this.options.processAlive);
+      const alive = this.options.processAlive ?? processAlive;
+      const live = readLiveProcesses(join(this.configDir, 'sessions'), alive);
+      for (const registry of [live.desktop, live.terminal])
+        for (const [id, process] of registry) {
+          this.knownProcesses.set(id, process);
+          this.confirmedExits.delete(id);
+        }
+      for (const registry of [live.exitedDesktop, live.exitedTerminal])
+        for (const [id, process] of registry)
+          if (!this.knownProcesses.has(id)) this.knownProcesses.set(id, process);
+      const exited = new Map<string, LiveProcess | TerminalProcess>();
+      for (const [id, process] of this.knownProcesses) {
+        if (!live.desktop.has(id) && !live.terminal.has(id) && (this.confirmedExits.has(id) || !alive(process.pid))) {
+          this.confirmedExits.add(id);
+          exited.set(id, process);
+        }
+      }
       const transcripts = new Map<string, TranscriptState>();
       const paths = new Set<string>();
       const projects = join(this.configDir, 'projects');
@@ -70,13 +88,15 @@ export class ClaudeObserver extends EventEmitter {
       const claimed = new Set(records.map(record => record.cliSessionId).filter(Boolean));
       this.agents = records.filter(record => !record.archived).map(record =>
         project(record.sessionId, record.cliSessionId ? transcripts.get(record.cliSessionId) : undefined,
-          live.desktop.get(record.sessionId) ?? (record.cliSessionId ? live.terminal.get(record.cliSessionId) : undefined), record, now));
-      for (const id of new Set([...transcripts.keys(), ...live.terminal.keys()])) {
-        if (!claimed.has(id)) this.agents.push(project(id, transcripts.get(id), live.terminal.get(id), undefined, now));
+          live.desktop.get(record.sessionId) ?? (record.cliSessionId ? live.terminal.get(record.cliSessionId) : undefined), record, now,
+          exited.get(record.sessionId) ?? (record.cliSessionId ? exited.get(record.cliSessionId) : undefined)));
+      const exitedTerminal = [...exited].filter(([, process]) => 'sessionId' in process).map(([id]) => id);
+      for (const id of new Set([...transcripts.keys(), ...live.terminal.keys(), ...exitedTerminal])) {
+        if (!claimed.has(id)) this.agents.push(project(id, transcripts.get(id), live.terminal.get(id), undefined, now, exited.get(id)));
       }
       const connected = live.desktop.size + live.terminal.size > 0;
       this.health = { provider: 'claude', state: connected ? 'live' : 'offline',
-        message: connected ? 'Reading Claude process state and local session history' :
+        message: connected ? 'Reading Claude process registry and local session history' :
           this.agents.length ? 'Reading Claude session history · no live process state' : 'No local Claude Code sessions found',
         lastObservedAt: this.agents.length ? now : null };
     } catch (error) {
@@ -92,8 +112,8 @@ export class ClaudeObserver extends EventEmitter {
 }
 
 function project(id: string, transcript: TranscriptState | undefined, live: LiveProcess | undefined,
-  record: DesktopRecord | undefined, now: number): Agent {
-  const terminal = live as TerminalProcess | undefined;
+  record: DesktopRecord | undefined, now: number, exited?: LiveProcess | TerminalProcess): Agent {
+  const terminal = (live ?? exited) as TerminalProcess | undefined;
   const directory = record?.cwd ?? transcript?.directory ?? terminal?.cwd ?? null;
   let runtime: Status = transcript?.runtime ?? 'UNKNOWN';
   let identity = transcript?.identity ?? null;
@@ -117,10 +137,16 @@ function project(id: string, transcript: TranscriptState | undefined, live: Live
     } else if (live.status === 'waiting') {
       runtime = 'WAITING'; identity = live.statusUpdatedAt ? `waiting:${live.statusUpdatedAt}` : null;
       detail = live.waitingFor === 'permission prompt' ? 'Waiting for approval in Claude' : 'Waiting for your input in Claude';
-    } else if (runtime !== 'DONE' && runtime !== 'ERROR') {
+    } else if (live.status === 'idle' && runtime !== 'DONE' && runtime !== 'ERROR') {
       runtime = 'IDLE'; identity = null; detail = 'Claude process is idle; no completed turn observed';
+    } else if (live.status === 'unknown' && runtime === 'UNKNOWN') {
+      detail = 'Claude process is open; no supported turn status is available';
     }
-  } else if (['WORKING', 'WAITING'].includes(runtime) && (!activityAt || now - activityAt > 120_000)) {
+  } else if (exited) {
+    runtime = 'EXITED'; identity = null; detail = 'Claude session exited; its recorded process is no longer running';
+    activityAt = Math.max(activityAt ?? 0, exited.statusUpdatedAt ?? 0) || undefined;
+  }
+  if ((!live || live.status === 'unknown') && ['WORKING', 'WAITING'].includes(runtime) && (!activityAt || now - activityAt > 120_000)) {
     runtime = 'UNKNOWN'; identity = null; detail = 'Claude session log is stale; no live process state';
   }
   const attention = ['DONE', 'ERROR', 'WAITING'].includes(runtime);
@@ -129,8 +155,8 @@ function project(id: string, transcript: TranscriptState | undefined, live: Live
     id: `claude:${id}`, provider: 'claude', externalId: id,
     title: (record?.titleSource === 'user' ? record.title : null) || transcript?.title || record?.title ||
       terminal?.name || `${directory ? basename(directory) : 'Claude'} · ${id.slice(0, 8)}`,
-    directory, runtime, status: runtime === 'WORKING' ? 'running' : attention ? 'review' : runtime === 'IDLE' ? 'read' : 'unknown',
-    detail, evidence: live ? 'live' : runtime === 'UNKNOWN' ? 'unavailable' : 'history',
+    directory, runtime, status: runtime === 'WORKING' ? 'running' : attention ? 'review' : ['IDLE', 'EXITED'].includes(runtime) ? 'read' : 'unknown',
+    detail, evidence: live && live.status !== 'unknown' ? 'live' : runtime === 'UNKNOWN' ? 'unavailable' : 'history',
     attentionKey, attentionToken: attentionKey ? JSON.stringify(['claude', runtime, attentionKey]) : null,
     awaitingInput: runtime === 'WAITING', archived: record?.archived ?? false,
     createdAt: record?.createdAt ?? transcript?.createdAt,

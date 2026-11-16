@@ -3,18 +3,20 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, rmSync, renameSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 import { ClaudeObserver } from '../src/claude-observer';
 import { TranscriptReader } from '../src/upstream/claude/transcript';
 import { readLiveProcesses } from '../src/upstream/claude/catalog';
 import { ReadState } from '../src/read-state';
 import { ArchiveState } from '../src/archive-state';
+import { statusSnapshot } from '../src/snapshot';
 
 const id = '00000000-0000-4000-8000-000000000001';
 const otherId = '00000000-0000-4000-8000-000000000002';
 const desktopId = `local_${id}`;
-function fixture() {
+function fixture(alive: (pid: number) => boolean = () => true) {
   const root = mkdtempSync(join(tmpdir(), 'tcm-claude-'));
   const config = join(root, 'config');
   const project = join(config, 'projects', '-tmp-project');
@@ -35,7 +37,7 @@ function fixture() {
   const record = (fields: Record<string, unknown> = {}) => writeFileSync(join(org, `${desktopId}.json`),
     JSON.stringify({ sessionId: desktopId, cliSessionId: id, title: 'Desktop task', cwd: '/tmp/project',
       createdAt: 1000, lastActivityAt: 2000, completedTurns: 1, initialMessage: 'SECRET', ...fields }));
-  const observer = new ClaudeObserver({ configDir: config, desktopDir: desktop, processAlive: () => true });
+  const observer = new ClaudeObserver({ configDir: config, desktopDir: desktop, processAlive: alive });
   const run = (args: string[]) => spawnSync(process.execPath,
     ['--disable-warning=ExperimentalWarning', '--import', 'tsx', 'src/cli.ts', ...args],
     { encoding: 'utf8', timeout: 10000, env: { ...process.env, CODEX_HOME: join(root, 'codex'),
@@ -110,6 +112,143 @@ test('Claude process registry overrides logs, distinguishes approval, idle and b
   assert.equal(readLiveProcesses(join(f.config, 'sessions'), () => true).terminal.size, 0);
   f.proc({ kind: 'headless' });
   assert.equal(readLiveProcesses(join(f.config, 'sessions'), () => true).terminal.size, 0);
+});
+
+test('Claude completed and active sessions become EXITED after their observed process dies and registry is removed', t => {
+  const running = new Set([123]);
+  const f = fixture(pid => running.has(pid));
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  f.append('custom-title', { customTitle: 'Finished Claude session' });
+  f.append('assistant', { message: { stop_reason: 'end_turn' } });
+  f.proc({ status: 'idle' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'DONE');
+  const read = new ReadState(join(f.root, 'read.json'));
+  read.toggle(f.observer.agents[0]);
+  running.clear();
+  rmSync(join(f.config, 'sessions', '123.json'));
+  f.observer.refresh();
+  const closed = f.observer.agents[0];
+  assert.equal(closed.runtime, 'EXITED');
+  assert.equal(closed.status, 'read');
+  assert.equal(closed.evidence, 'history');
+  assert.equal(closed.attentionToken, null);
+  assert.equal(closed.awaitingInput, false);
+  assert.equal(closed.title, 'Finished Claude session');
+  const snapshot = statusSnapshot(f.observer, read, new ArchiveState(join(f.root, 'archive.json')));
+  assert.equal(snapshot.counts.statuses.EXITED, 1);
+  assert.equal(snapshot.counts.statuses.DONE, 0);
+  assert.equal(snapshot.counts.needsAttention, 0);
+  // Reuse of the old PID cannot revive a session whose exit was already confirmed.
+  running.add(123);
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'EXITED');
+  // A new live registry entry for this exact session clears the exit state.
+  f.proc({ status: 'busy' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'WORKING');
+  running.clear();
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'EXITED', 'a dead stale registry also proves exit');
+});
+
+test('Claude identity-only registry entries detect terminal exits without inventing a live turn status', t => {
+  let running = true;
+  const f = fixture(() => running);
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  f.proc({ status: undefined, statusUpdatedAt: undefined });
+  f.append('assistant', { message: { stop_reason: 'end_turn' } });
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'DONE');
+  assert.equal(f.observer.agents[0].evidence, 'history');
+  assert.equal(readLiveProcesses(join(f.config, 'sessions'), () => true).terminal.get(id)?.status, 'unknown');
+  f.append('user');
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'WORKING');
+  f.append('user', { timestamp: new Date(Date.now() - 180_000).toISOString() });
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'UNKNOWN');
+  running = false;
+  rmSync(join(f.config, 'sessions', '123.json'));
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'EXITED');
+});
+
+test('Claude registry exits survive monitor startup and preserve sessions with no transcript', t => {
+  const f = fixture(() => false);
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  f.proc({ name: 'Exited terminal', status: 'waiting', waitingFor: 'permission prompt' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents.length, 1);
+  assert.equal(f.observer.agents[0].runtime, 'EXITED');
+  assert.equal(f.observer.agents[0].title, 'Exited terminal');
+  assert.equal(f.observer.agents[0].directory, '/tmp/project');
+  assert.equal(readLiveProcesses(join(f.config, 'sessions'), () => false).exitedTerminal.size, 1);
+  rmSync(join(f.config, 'sessions', '123.json'));
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'EXITED');
+});
+
+test('Claude missing or malformed registry records do not prove exit while the recorded process is alive', t => {
+  let inspect = true;
+  const f = fixture(() => { if (!inspect) throw new Error('inspection unavailable'); return true; });
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  f.append('assistant', { message: { stop_reason: 'end_turn' } });
+  f.proc({ status: 'idle' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'DONE');
+  const registry = join(f.config, 'sessions', '123.json');
+  writeFileSync(registry, '{partial');
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'DONE');
+  rmSync(registry);
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'DONE');
+  inspect = false;
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'UNKNOWN');
+  assert.equal(f.observer.health.state, 'degraded');
+  inspect = true;
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'DONE');
+});
+
+test('Claude desktop records use confirmed exit state without duplicating their CLI transcript', t => {
+  let running = true;
+  const f = fixture(() => running);
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  f.record();
+  f.append('assistant', { message: { stop_reason: 'end_turn' } });
+  f.proc({ hostSessionId: desktopId, entrypoint: 'claude-desktop', status: 'idle' });
+  f.observer.refresh();
+  assert.equal(f.observer.agents[0].runtime, 'DONE');
+  running = false;
+  rmSync(join(f.config, 'sessions', '123.json'));
+  f.observer.refresh();
+  assert.equal(f.observer.agents.length, 1);
+  assert.equal(f.observer.agents[0].runtime, 'EXITED');
+  assert.equal(f.observer.agents[0].externalId, desktopId);
+});
+
+test('Claude exit detection observes a real process terminating after its registry is cleaned up', async t => {
+  const f = fixture();
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  t.after(() => { child.kill(); rmSync(f.root, { recursive: true, force: true }); });
+  await once(child, 'spawn');
+  const registry = join(f.config, 'sessions', `${child.pid}.json`);
+  writeFileSync(registry, JSON.stringify({ pid: child.pid, sessionId: id, entrypoint: 'cli',
+    kind: 'interactive', status: 'idle', cwd: '/tmp/project', name: 'Real process fixture' }));
+  f.append('assistant', { message: { stop_reason: 'end_turn' } });
+  const observer = new ClaudeObserver({ configDir: f.config, desktopDir: join(f.root, 'desktop') });
+  observer.refresh();
+  assert.equal(observer.agents[0].runtime, 'DONE');
+  const ended = once(child, 'exit');
+  child.kill();
+  await ended;
+  rmSync(registry);
+  observer.refresh();
+  assert.equal(observer.agents[0].runtime, 'EXITED');
+  assert.equal(observer.agents[0].attentionToken, null);
 });
 
 test('Claude generated session names replace directory/ID and process-name fallbacks and refresh without activity changes', t => {

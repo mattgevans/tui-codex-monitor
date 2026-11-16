@@ -30,7 +30,7 @@ export interface DesktopRecord {
 /** A Claude Code process registered in `<config>/sessions/<pid>.json`. */
 export interface LiveProcess {
   pid: number;
-  status: 'busy' | 'shell' | 'idle' | 'waiting';
+  status: 'busy' | 'shell' | 'idle' | 'waiting' | 'unknown';
   waitingFor: string | null;
   statusUpdatedAt: number | null;
 }
@@ -111,7 +111,8 @@ export function processAlive(pid: number) {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
+    // Only ESRCH proves exit. Permission/inspection errors must not claim a process died.
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
   }
 }
 
@@ -127,14 +128,17 @@ export interface LiveProcesses {
   desktop: Map<string, LiveProcess>;
   /** Keyed by Claude Code session uuid. */
   terminal: Map<string, TerminalProcess>;
+  /** Valid registry identities whose owning process has exited. */
+  exitedDesktop: Map<string, LiveProcess>;
+  exitedTerminal: Map<string, TerminalProcess>;
 }
 
-/** Newest live process per session. Dead, headless and malformed entries are ignored. */
+/** Newest process per session, with confirmed exits separate from live state. */
 export function readLiveProcesses(
   registry: string,
   alive: (pid: number) => boolean = processAlive,
 ): LiveProcesses {
-  const out: LiveProcesses = { desktop: new Map(), terminal: new Map() };
+  const out: LiveProcesses = { desktop: new Map(), terminal: new Map(), exitedDesktop: new Map(), exitedTerminal: new Map() };
   let names: string[];
   try {
     names = readdirSync(registry);
@@ -151,9 +155,8 @@ export function readLiveProcesses(
     if (pid < 1 || pid > 0x7fffffff) continue;
     const raw = readJson(join(registry, name));
     if (!raw || raw.pid !== pid) continue;
-    const status = raw.status;
-    if (status !== 'busy' && status !== 'shell' && status !== 'idle' && status !== 'waiting')
-      continue;
+    const status = raw.status === 'busy' || raw.status === 'shell' || raw.status === 'idle' || raw.status === 'waiting'
+      ? raw.status : 'unknown';
     const host = raw.hostSessionId,
       session = raw.sessionId;
     const desktop = typeof host === 'string' && validSessionId(host);
@@ -163,7 +166,8 @@ export function readLiveProcesses(
       raw.kind === 'interactive' &&
       typeof session === 'string' &&
       uuid.test(session);
-    if ((!desktop && !terminal) || !alive(pid)) continue;
+    if (!desktop && !terminal) continue;
+    const running = alive(pid);
     const entry: LiveProcess = {
       pid,
       status,
@@ -175,14 +179,17 @@ export function readLiveProcesses(
       statusUpdatedAt: time(raw.statusUpdatedAt),
     };
     if (desktop) {
-      if (newer(out.desktop.get(host), entry)) out.desktop.set(host, entry);
-    } else if (newer(out.terminal.get(session as string), entry))
-      out.terminal.set(session as string, {
+      const target = running ? out.desktop : out.exitedDesktop;
+      if (newer(target.get(host), entry)) target.set(host, entry);
+    } else {
+      const target = running ? out.terminal : out.exitedTerminal;
+      if (newer(target.get(session as string), entry)) target.set(session as string, {
         ...entry,
         sessionId: session as string,
         cwd: text(raw.cwd),
         name: text(raw.name)?.slice(0, 200) ?? null,
       });
+    }
   }
   return out;
 }

@@ -69,7 +69,7 @@ Use a terminal at least 80 columns wide and 24 rows high. Provider, session name
 | `IDLE` | Idle/not-loaded runtime or idle Claude process without a completed or failed latest turn |
 | `DONE` | Completed/interrupted Codex turn or explicit Claude completion metadata |
 | `ERROR` | System error, failed latest turn, or Claude API error metadata |
-| `EXITED` | CLI session log has no owning Codex process (read-only `lsof` check) |
+| `EXITED` | No owning Codex process holds the session log, or a recorded Claude session process has terminated |
 | `UNKNOWN` | No supported desktop state or usable session-log evidence |
 
 `!` and amber highlight mean attention is needed: input/approval, an error, or an unread finished response. `▶` and blue identify working agents. `r` marks a locally acknowledged item. Labels and markers remain readable without relying on color alone.
@@ -103,10 +103,13 @@ This uses Codex's private desktop protocol, currently stream version 11 and read
 ## Claude Code integration
 
 - Discover top-level UUID-named session logs in `~/.claude/projects/<project>/*.jsonl` (or under `CLAUDE_CONFIG_DIR`) every second. Nested subagent transcripts and sidechain events are excluded. The monitor does not call Claude or install hooks.
-- Read live process metadata from `<config>/sessions/<pid>.json`, ignoring dead PIDs, unsupported statuses, and unrelated/headless registry entries. `busy`/`shell`, `waiting`, and `idle` map to working, waiting, and idle. Permission waits are distinguished from other input waits. Older Claude versions may not expose this registry.
+- Read process metadata from `<config>/sessions/<pid>.json`, excluding unrelated/headless registry entries. `busy`/`shell`, `waiting`, and `idle` map to working, waiting, and idle. Permission waits are distinguished from other input waits. Identity-only records without a supported status still establish process ownership; turn status then comes from the transcript. Older Claude versions may not expose this registry.
 - On macOS, also discover local desktop Code-tab records under `~/Library/Application Support/Claude/claude-code-sessions`. Set `CLAUDE_DESKTOP_DIR` to override this monitor's desktop store path. A desktop record linked to a CLI transcript appears once, under its desktop ID; source-archived records are excluded.
-- Without live process state, use explicit transcript metadata: user/assistant activity, `AskUserQuestion`, assistant `end_turn`/`stop_sequence`, system `turn_duration`, and API error flags. Ordinary tool calls do not prove an approval wait. Log-only working/waiting evidence expires after two minutes; a silent long operation can become `UNKNOWN`. Historical completions remain `DONE`; absence of a registry entry does not prove exit.
+- Without live process state, use explicit transcript metadata: user/assistant activity, `AskUserQuestion`, assistant `end_turn`/`stop_sequence`, system `turn_duration`, and API error flags. Ordinary tool calls do not prove an approval wait. Log-only working/waiting evidence expires after two minutes; a silent long operation can become `UNKNOWN`. Historical completions without process ownership evidence remain `DONE`; absence of a registry entry alone does not prove exit.
+- Retain observed Claude process identities in memory. When a recorded process has terminated, show `EXITED`, including when Claude removes its registry file during clean shutdown. Valid registry records for already-dead processes also establish exit after monitor startup. A new live process for the session takes precedence. Closed sessions remain listed, preserve their names, and do not need attention.
 - Read at most a 1 MiB prefix and 2 MiB tail per changed transcript, caching only metadata. Incomplete lines, mismatched session IDs, and unsupported evidence do not establish status. Titles use Claude's saved manual or AI-generated names when available, with manual names taking priority. Sessions without a saved name use directory/session-ID labels; prompt and response text are never used as titles.
+
+If the monitor starts after a session closed and its registry record has already been removed, only transcript history is available; a completed turn stays `DONE`. A missing record, a quiet log, or a process inspection error does not establish exit.
 
 Live registry state takes precedence over transcript history. Provider labels appear in the session list, and provider-prefixed IDs keep local read/archive flags separate. Cloud-only sessions, ordinary Claude chats, Cowork sessions, and sessions stored on another machine are outside this integration.
 
